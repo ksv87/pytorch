@@ -21,7 +21,7 @@ from torch._dispatch.python import enable_python_dispatcher
 from torch._dynamo.utils import dynamo_timed
 from torch._subclasses import CrossRefFakeMode, FakeTensor, FakeTensorMode
 from torch.fx import immutable_collections, Interpreter
-from torch.fx.experimental.proxy_tensor import is_sym_node, py_sym_types
+from torch.fx.experimental.proxy_tensor import is_sym_node, py_sym_types, PhiloxRandomState, FunctionalizeRngOpsMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.multiprocessing.reductions import StorageWeakRef
 from torch.nn.utils import stateless
@@ -1119,6 +1119,8 @@ def create_forward_or_joint_functionalized(
         # Wrap inputs into functional wrappers
         f_primals = pytree.tree_map(to_fun, primals)
         f_tangents = None if maybe_tangents is None else pytree.tree_map(to_fun, maybe_tangents)
+
+
         torch._enable_functionalization(reapply_views=True)
         try:
             # Run the joint
@@ -2063,6 +2065,31 @@ def create_runtime_wrapper(
             return fw_outs
     return runtime_wrapper
 
+def create_functionalized_rng_ops_wrapper(func, args, trace_joint=True):
+    # Functionalization of rng ops changes the calling convention of the joint graph.
+    # It goes from (primals, tangents) to (primals, tangents, seed, offset)
+    # At runtime, we pass on the current seed and offset. This is hidden from
+    # the user.
+    # Get the current seed and offset to setup tracing.
+    example_seed, example_offset = PhiloxRandomState.get_current_seed_offset()
+    PhiloxRandomState.set_seed_offset_concrete_arg(example_seed, example_offset)
+
+    # Partitioner logic uses the string "primals" and "tangents"
+    # Even though example_seed is not used here, we will use it while
+    # functionalizing the rng ops in FunctionalizeRngOpsMode
+    def traced_joint(primals, tangents, example_seed, example_offset):
+        with FunctionalizeRngOpsMode():
+            return func(primals, tangents)
+
+    def traced_forward(*primals, example_seed, example_offset):
+        with FunctionalizeRngOpsMode():
+            return func(primals)
+
+    if trace_joint:
+        return traced_joint, (*args, example_seed, example_offset)
+    else:
+        return traced_forward, (*args, example_seed, example_offset)
+
 # Has the precondition that there
 # are no duplicate arguments in flat_args (e.g., the same Tensor
 # object never shows up twice.  However, two tensor inputs MAY alias
@@ -2116,6 +2143,9 @@ def aot_dispatch_autograd(flat_fn, flat_args: List[Any], aot_config: AOTConfig):
 
     joint_inputs = (flat_args_with_views_handled, traced_tangents)
 
+    if config.functionalize_rng_ops:
+        joint_forward_backward, joint_inputs = create_functionalized_rng_ops_wrapper(joint_forward_backward, joint_inputs, trace_joint=True)
+
     disable_amp = torch._C._is_any_autocast_enabled()
 
     if config.use_functionalize:
@@ -2127,6 +2157,7 @@ def aot_dispatch_autograd(flat_fn, flat_args: List[Any], aot_config: AOTConfig):
 
         # There should be *NO* mutating ops in the graph at this point.
         assert_functional_graph(fx_g.graph)
+
         # Redudant with the check above, but worth having in case tracing introduced
         # a fake tensor. Unlikely.
         # See Note: [Fake Modules and AOTAutograd]
@@ -2179,7 +2210,10 @@ def aot_dispatch_autograd(flat_fn, flat_args: List[Any], aot_config: AOTConfig):
 
         @staticmethod
         def forward(ctx, *deduped_flat_tensor_args):
-
+            args = deduped_flat_tensor_args
+            if config.functionalize_rng_ops:
+                seed, offset = PhiloxRandomState.get_current_seed_offset()
+                args = (*args, seed, offset)
             # There is a pretty complicated calling convention around what the compiled fw returns.
             # The full list of outputs and their relative order is:
             # (*mutated_inputs, *fw_outs, *fw_intermediate_bases, *saved_tensors, *saved_symints)
@@ -2187,7 +2221,7 @@ def aot_dispatch_autograd(flat_fn, flat_args: List[Any], aot_config: AOTConfig):
             #   of the original view, and not the synthetic base
             fw_outs = call_func_with_args(
                 CompiledFunction.compiled_fw,
-                deduped_flat_tensor_args,
+                args,
                 disable_amp=disable_amp,
             )
 
@@ -2277,6 +2311,11 @@ def aot_dispatch_autograd(flat_fn, flat_args: List[Any], aot_config: AOTConfig):
             ]
             ctx.mark_non_differentiable(*fw_outs_not_requiring_grad)
 
+            # TODO - We bulk update the offset here. But, this is mostly wrong. We need
+            # to know the fwd and bwd offset, and it depends on where the partitioner
+            # decided to make the cut.
+            if config.functionalize_rng_ops:
+                PhiloxRandomState.bulk_update_offset()
             return tuple(raw_returns)
 
         @staticmethod
@@ -2382,6 +2421,11 @@ def aot_dispatch_autograd(flat_fn, flat_args: List[Any], aot_config: AOTConfig):
                     disable_amp=disable_amp,
                 )
 
+                # TODO - We bulk update the offset here. But, this is mostly wrong. We need
+                # to know the fwd and bwd offset, and it depends on where the partitioner
+                # decided to make the cut.
+                if config.functionalize_rng_ops:
+                    PhiloxRandomState.bulk_update_offset()
                 return tuple(out)
 
             if torch.is_grad_enabled() and any(t.requires_grad for t in all_args if isinstance(t, torch.Tensor)):
@@ -2491,12 +2535,15 @@ def create_aot_dispatcher_function(
     # Check flat_args to see if they're already fake.  If so, use that fake
     # mode instead.
 
+    fake_mode_init = False
     for x in flat_args:
         if isinstance(x, FakeTensor):
             fake_mode = x.fake_mode
             shape_env = fake_mode.shape_env
+            fake_mode_init = True
             break
-    else:
+
+    if not fake_mode_init:
         shape_env = ShapeEnv() if aot_config.dynamic_shapes else None
         fake_mode = (
             FakeTensorMode(shape_env=shape_env)
