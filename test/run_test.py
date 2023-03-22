@@ -1299,7 +1299,7 @@ def main():
 
     # parallel = in parallel with other files
     # serial = this file on it's own.  The file might still be run in parallel with itself (ex test_ops)
-    selected_tests_parallel = [x for x in selected_tests if not must_serial(x)]
+    selected_tests_parallel = [x for x in selected_tests if not must_serial(x.name)]
     selected_tests_serial = [x for x in selected_tests if x not in selected_tests_parallel]
     print_to_stderr("parallel (file granularity) tests:\n {}".format("\n ".join(str(x) for x in selected_tests_parallel)))
     print_to_stderr("serial (file granularity) tests:\n {}".format("\n ".join(str(x) for x in selected_tests_serial)))
