@@ -38,6 +38,17 @@ float randn_cpu(uint32_t seed, uint32_t offset) {
 template <typename T> struct AsIntegerType { typedef T type; };
 template <> struct AsIntegerType<float> { typedef uint32_t type; };
 template <> struct AsIntegerType<double> { typedef uint64_t type; };
+template <> struct AsIntegerType<bfloat16> { typedef uint16_t type; };
+
+template <typename T>
+inline T fetch_value(volatile T *addr) {
+  return *addr;
+}
+
+template <>
+inline bfloat16 fetch_value<bfloat16>(volatile bfloat16 *addr) {
+  return bfloat16(addr->x);
+}
 
 template <typename T> void atomic_add(volatile T *addr, T offset) {
   typedef typename AsIntegerType<T>::type alt_type;
@@ -51,7 +62,7 @@ template <typename T> void atomic_add(volatile T *addr, T offset) {
 
   std::atomic<alt_type> *atomic_addr = (std::atomic<alt_type> *)addr;
   do {
-    T val = *addr;
+    T val = fetch_value(addr);
     reinterpret_cast<T *>(&expected)[0] = val;
     reinterpret_cast<T *>(&desired)[0] = val + offset;
   } while (!atomic_addr->compare_exchange_weak(expected, desired,
@@ -84,6 +95,11 @@ void flag_to_float(T src, float* dst, int64_t n) {
 inline at::vec::Vectorized<float> load_bf16_as_float(const bfloat16* bf16_buf) {
   at::vec::Vectorized<float> res_vec(0);
   at::vec::load_fp32_from_bf16(bf16_buf, res_vec);
+  return res_vec;
+}
+
+inline at::vec::Vectorized<float> load_bf16_as_float(const bfloat16& bf16_buf) {
+  at::vec::Vectorized<float> res_vec(static_cast<float>(bf16_buf));
   return res_vec;
 }
 
